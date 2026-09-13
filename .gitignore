@@ -1,0 +1,10 @@
+# Composer dependencies
+vendor/
+
+# Archives and temporary files
+*.zip
+*.log
+
+# Environment configurations
+.env
+.env.local
