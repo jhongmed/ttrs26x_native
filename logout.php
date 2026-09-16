@@ -3,7 +3,9 @@
  * TTRS 2.6.x - Logout
  */
 
-session_start();
+require_once __DIR__ . '/auth_common.php';
+
+init_secure_session();
 
 $_SESSION = [];
 

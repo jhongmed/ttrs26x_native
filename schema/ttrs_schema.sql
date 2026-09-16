@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS login_history (
     id                  BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     user_id             INT UNSIGNED NULL,
-    username_attempted  VARCHAR(50)  NOT NULL,
+    username_attempted  VARCHAR(255) NOT NULL,
     ip_address          VARCHAR(45)  NOT NULL,      -- IPv4 or IPv6
     user_agent          VARCHAR(255) NULL,
     status              ENUM('success', 'failed') NOT NULL,
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS login_history (
         FOREIGN KEY (user_id) REFERENCES users(id)
         ON DELETE SET NULL,
 
-    INDEX idx_login_history_username (username_attempted),
+    INDEX idx_login_history_username (username_attempted(191)),
     INDEX idx_login_history_attempted_at (attempted_at),
     INDEX idx_login_history_status (status)
 ) ENGINE=InnoDB;
@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS password_resets (
     CONSTRAINT fk_password_resets_email
         FOREIGN KEY (email) REFERENCES users(email)
         ON DELETE CASCADE
+        ON UPDATE CASCADE
 ) ENGINE=InnoDB;
 
 -- -----------------------------------------------------------------

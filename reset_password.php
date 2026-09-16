@@ -4,15 +4,13 @@
  *
  * Verifies the (email, token) pair from the emailed link against
  * the password_resets table, checks expiry, and if valid lets the
- * user set a new password. The token row is deleted after use so
- * it can't be replayed.
+ * user set a new password. The token row is deleted after use.
  */
 
-if (session_status() === PHP_SESSION_NONE) {
-    session_start();
-}
-require_once __DIR__ . '/db_config.php';
 require_once __DIR__ . '/auth_common.php';
+require_once __DIR__ . '/db_config.php';
+
+init_secure_session();
 
 if (!empty($_SESSION['user_id'])) {
     header('Location: dashboard.php');
@@ -33,6 +31,9 @@ function verify_reset_token(PDO $pdo, string $email, string $token): bool
     }
 
     if (strtotime($row['expires_at']) < time()) {
+        // Clean up expired token
+        $del = $pdo->prepare('DELETE FROM password_resets WHERE email = ?');
+        $del->execute([$email]);
         return false;
     }
 
@@ -45,7 +46,7 @@ function consume_reset_token(PDO $pdo, string $email): void
     $stmt->execute([$email]);
 }
 
-$email = trim($_GET['email'] ?? $_POST['email'] ?? '');
+$email = strtolower(trim($_GET['email'] ?? $_POST['email'] ?? ''));
 $token = trim($_GET['token'] ?? $_POST['token'] ?? '');
 
 $errors     = [];
@@ -74,9 +75,11 @@ if ($token_ok && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password
     $confirm  = $_POST['password_confirmation'] ?? '';
 
     if (!csrf_check($csrf)) {
-        $errors[] = 'Your session has expired. Please try again.';
+        $errors[] = 'Your session has expired. Please refresh and try again.';
     } elseif (strlen($password) < 8) {
         $errors[] = 'Password must be at least 8 characters long.';
+    } elseif (strlen($password) > 72) {
+        $errors[] = 'Password cannot exceed 72 characters.';
     } elseif ($password !== $confirm) {
         $errors[] = 'Passwords do not match.';
     } else {
@@ -88,6 +91,7 @@ if ($token_ok && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password
             $stmt->execute([$hash, $email]);
 
             consume_reset_token($pdo, $email);
+            csrf_regenerate();
 
             $done = true;
         } catch (PDOException $e) {

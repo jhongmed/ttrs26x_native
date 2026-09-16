@@ -4,17 +4,14 @@
  *
  * Takes an email address, and if it matches an active user, creates
  * a one-time reset token (hashed in the DB, TTL from RESET_TOKEN_TTL_MINUTES)
- * and emails a reset link. Always shows the same success message
- * regardless of whether the email exists, to avoid leaking which
- * addresses are registered.
+ * and emails a reset link.
  */
 
-if (session_status() === PHP_SESSION_NONE) {
-    session_start();
-}
-require_once __DIR__ . '/db_config.php';
 require_once __DIR__ . '/auth_common.php';
+require_once __DIR__ . '/db_config.php';
 require_once __DIR__ . '/mail_config.php';
+
+init_secure_session();
 
 if (!empty($_SESSION['user_id'])) {
     header('Location: dashboard.php');
@@ -24,11 +21,17 @@ if (!empty($_SESSION['user_id'])) {
 /**
  * Creates (or replaces) a reset token for the given email and
  * returns the plaintext token to send in the email link. Returns
- * null if no active user has that email — caller should still show
- * the generic success message either way.
+ * null if no active user has that email.
  */
 function create_reset_token(PDO $pdo, string $email): ?string
 {
+    // Clean up expired tokens
+    try {
+        $pdo->exec('DELETE FROM password_resets WHERE expires_at < NOW()');
+    } catch (Exception $e) {
+        // Non-fatal if cleanup fails
+    }
+
     $stmt = $pdo->prepare('SELECT id FROM users WHERE email = ? AND status = "active" LIMIT 1');
     $stmt->execute([$email]);
     if (!$stmt->fetch()) {
@@ -37,7 +40,7 @@ function create_reset_token(PDO $pdo, string $email): ?string
 
     $token     = bin2hex(random_bytes(32));
     $tokenHash = hash('sha256', $token);
-    $expiresAt = (new DateTime())->modify('+' . RESET_TOKEN_TTL_MINUTES . ' minutes')->format('Y-m-d H:i:s');
+    $expiresAt = date('Y-m-d H:i:s', time() + (RESET_TOKEN_TTL_MINUTES * 60));
 
     $stmt = $pdo->prepare(
         'INSERT INTO password_resets (email, token_hash, expires_at)
@@ -50,7 +53,7 @@ function create_reset_token(PDO $pdo, string $email): ?string
 }
 
 /**
- * Sends the reset link by email via Gmail SMTP (PHPMailer).
+ * Sends the reset link by email via SMTP (PHPMailer).
  */
 function send_reset_email(string $email, string $resetUrl): bool
 {
@@ -115,11 +118,11 @@ $errors  = [];
 $sent    = false;
 
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
-    $email = trim($_POST['email'] ?? '');
+    $email = strtolower(trim($_POST['email'] ?? ''));
     $token = $_POST['csrf_token'] ?? '';
 
     if (!csrf_check($token)) {
-        $errors[] = 'Your session has expired. Please try again.';
+        $errors[] = 'Your session has expired. Please refresh and try again.';
     } elseif ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
         $errors[] = 'Please enter a valid email address.';
     } else {
@@ -128,25 +131,24 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $resetToken  = create_reset_token($pdo, $email);
 
             if ($resetToken !== null) {
-                $scheme    = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == 443) ? 'https' : 'http';
-                $host      = $_SERVER['HTTP_HOST'] ?? 'localhost';
-                $scriptDir = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '')), '/');
-                $resetUrl  = sprintf(
-                    '%s://%s%s/reset_password.php?email=%s&token=%s',
-                    $scheme,
-                    $host,
-                    $scriptDir,
+                $resetUrl = sprintf(
+                    '%s/reset_password.php?email=%s&token=%s',
+                    app_base_url(),
                     urlencode($email),
                     $resetToken
                 );
+
                 $mailSent = send_reset_email($email, $resetUrl);
                 if (!$mailSent) {
                     error_log('[TTRS Mail] Failed to send password reset email to: ' . $email);
+                    $errors[] = 'We could not send the password reset email at this moment. Please try again later or contact the administrator.';
+                } else {
+                    $sent = true;
                 }
+            } else {
+                // Report generic success when email does not exist to prevent enumeration
+                $sent = true;
             }
-
-            // Always report success, whether or not the email existed
-            $sent = true;
         } catch (PDOException $e) {
             error_log('TTRS DB error (forgot_password): ' . $e->getMessage());
             $errors[] = 'We could not process your request right now. Please try again shortly.';

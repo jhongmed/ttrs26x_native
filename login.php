@@ -4,15 +4,13 @@
  * Tee Time Reservation System — The Orchard Golf & Country Club
  *
  * Authenticates against the `users` table and records every attempt
- * (successful or failed) into `login_history`. See ttrs_schema.sql
- * for the database schema and db_config.php for connection settings.
+ * (successful or failed) into `login_history`.
  */
 
-if (session_status() === PHP_SESSION_NONE) {
-    session_start();
-}
-require_once __DIR__ . '/db_config.php';
 require_once __DIR__ . '/auth_common.php';
+require_once __DIR__ . '/db_config.php';
+
+init_secure_session();
 
 // Redirect if already logged in
 if (!empty($_SESSION['user_id'])) {
@@ -21,27 +19,62 @@ if (!empty($_SESSION['user_id'])) {
 }
 
 // ---------------------------------------------------------------
-// HELPERS
+// RATE LIMITING HELPERS
 // ---------------------------------------------------------------
-function is_locked_out(): bool
+function is_locked_out(?string $usernameOrEmail = null): bool
 {
-    if (!isset($_SESSION['login_attempts'], $_SESSION['first_attempt_time'])) {
-        return false;
-    }
-    if ($_SESSION['login_attempts'] >= MAX_LOGIN_ATTEMPTS) {
+    // Layer 1: In-session check
+    if (isset($_SESSION['login_attempts'], $_SESSION['first_attempt_time'])) {
         $elapsed = time() - $_SESSION['first_attempt_time'];
-        if ($elapsed < LOCKOUT_SECONDS) {
+        if ($_SESSION['login_attempts'] >= MAX_LOGIN_ATTEMPTS) {
+            if ($elapsed < LOCKOUT_SECONDS) {
+                return true;
+            }
+            // Lockout window expired — reset session counters
+            unset($_SESSION['login_attempts'], $_SESSION['first_attempt_time']);
+        } elseif ($elapsed >= LOCKOUT_SECONDS) {
+            // Expire stale attempt counter
+            unset($_SESSION['login_attempts'], $_SESSION['first_attempt_time']);
+        }
+    }
+
+    // Layer 2: Database-backed check across IP and username
+    try {
+        $pdo = get_db_connection();
+        $ip  = mb_substr($_SERVER['REMOTE_ADDR'] ?? '', 0, 45);
+        $cutoff = date('Y-m-d H:i:s', time() - LOCKOUT_SECONDS);
+
+        if ($usernameOrEmail !== null && $usernameOrEmail !== '') {
+            $stmt = $pdo->prepare(
+                'SELECT COUNT(*) FROM login_history
+                 WHERE (ip_address = ? OR username_attempted = ?)
+                   AND status = "failed"
+                   AND attempted_at >= ?'
+            );
+            $stmt->execute([$ip, mb_substr($usernameOrEmail, 0, 255), $cutoff]);
+        } else {
+            $stmt = $pdo->prepare(
+                'SELECT COUNT(*) FROM login_history
+                 WHERE ip_address = ?
+                   AND status = "failed"
+                   AND attempted_at >= ?'
+            );
+            $stmt->execute([$ip, $cutoff]);
+        }
+
+        if ((int) $stmt->fetchColumn() >= MAX_LOGIN_ATTEMPTS) {
             return true;
         }
-        // Lockout window expired — reset counters
-        unset($_SESSION['login_attempts'], $_SESSION['first_attempt_time']);
+    } catch (Exception $e) {
+        // If DB query fails, session-level rate limiting remains active
     }
+
     return false;
 }
 
 function register_failed_attempt(): void
 {
-    if (!isset($_SESSION['login_attempts'])) {
+    if (!isset($_SESSION['login_attempts']) || (isset($_SESSION['first_attempt_time']) && time() - $_SESSION['first_attempt_time'] >= LOCKOUT_SECONDS)) {
         $_SESSION['login_attempts'] = 0;
         $_SESSION['first_attempt_time'] = time();
     }
@@ -50,34 +83,39 @@ function register_failed_attempt(): void
 
 /**
  * AUTHENTICATION LOGIC
- * ---------------------------------------------------------------
- * Looks the user up by username, verifies their bcrypt password
- * hash, and records the outcome (success or failure) into
- * login_history — including attempts for usernames that don't
- * exist at all, which is important for audit/security review.
  */
 function attempt_login(string $usernameOrEmail, string $password): ?array
 {
     $pdo = get_db_connection();
+    $cleanUsername = trim($usernameOrEmail);
 
     $stmt = $pdo->prepare(
-        'SELECT id, username, password_hash, role, status
+        'SELECT id, username, email, password_hash, role, status
          FROM users
          WHERE username = ? OR email = ?
          LIMIT 1'
     );
-    $stmt->execute([$usernameOrEmail, $usernameOrEmail]);
+    $stmt->execute([$cleanUsername, $cleanUsername]);
     $user = $stmt->fetch();
 
     $success = false;
     $userId  = null;
+    $dummyHash = '$2y$10$e8w3k7V0gZ9mEwD9y6h4g.sDk3s1B7vO6Yk7p8h4c8a2e1m7g4a5e';
 
-    if ($user && $user['status'] === 'active' && password_verify($password, $user['password_hash'])) {
-        $success = true;
-        $userId  = $user['id'];
+    if ($user) {
+        $userId = (int) $user['id'];
+        if ($user['status'] === 'active' && password_verify($password, $user['password_hash'])) {
+            $success = true;
+        } else {
+            // Constant-time execution if account is inactive or password mismatch
+            password_verify($password, $user['password_hash']);
+        }
+    } else {
+        // Prevent username enumeration via timing attacks
+        password_verify($password, $dummyHash);
     }
 
-    log_login_attempt($pdo, $userId, $usernameOrEmail, $success);
+    log_login_attempt($pdo, $userId, $cleanUsername, $success);
 
     if (!$success) {
         return null;
@@ -91,21 +129,25 @@ function attempt_login(string $usernameOrEmail, string $password): ?array
 }
 
 /**
- * Records one row per login attempt into login_history.
+ * Records one row per login attempt into login_history with safe truncation.
  */
 function log_login_attempt(PDO $pdo, ?int $userId, string $usernameAttempted, bool $success): void
 {
-    $stmt = $pdo->prepare(
-        'INSERT INTO login_history (user_id, username_attempted, ip_address, user_agent, status)
-         VALUES (?, ?, ?, ?, ?)'
-    );
-    $stmt->execute([
-        $userId,
-        $usernameAttempted,
-        $_SERVER['REMOTE_ADDR'] ?? 'unknown',
-        substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 255),
-        $success ? 'success' : 'failed',
-    ]);
+    try {
+        $stmt = $pdo->prepare(
+            'INSERT INTO login_history (user_id, username_attempted, ip_address, user_agent, status)
+             VALUES (?, ?, ?, ?, ?)'
+        );
+        $stmt->execute([
+            $userId,
+            mb_substr($usernameAttempted, 0, 255),
+            mb_substr($_SERVER['REMOTE_ADDR'] ?? 'unknown', 0, 45),
+            mb_substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 255),
+            $success ? 'success' : 'failed',
+        ]);
+    } catch (Exception $e) {
+        error_log('TTRS login_history log error: ' . $e->getMessage());
+    }
 }
 
 // ---------------------------------------------------------------
@@ -128,9 +170,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $token        = $_POST['csrf_token'] ?? '';
 
     if (!csrf_check($token)) {
-        $errors[] = 'Your session has expired. Please try again.';
-    } elseif (is_locked_out()) {
-        $errors[] = 'Too many failed attempts. Please try again in a few minutes.';
+        $errors[] = 'Your session has expired. Please refresh and try again.';
+    } elseif (is_locked_out($old_username)) {
+        $errors[] = 'Too many failed attempts. Please wait a few minutes before trying again.';
     } elseif ($old_username === '' || $password === '') {
         $errors[] = 'Please enter both username and password.';
     } else {
@@ -146,18 +188,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         if ($user) {
-            // Success — reset attempt counters, regenerate session
+            // Success — reset attempt counters, regenerate session ID & CSRF
             unset($_SESSION['login_attempts'], $_SESSION['first_attempt_time']);
             session_regenerate_id(true);
+            csrf_regenerate();
 
-            $_SESSION['user_id']  = $user['id'];
-            $_SESSION['username'] = $user['username'];
-            $_SESSION['role']     = $user['role'];
+            $_SESSION['user_id']      = (int) $user['id'];
+            $_SESSION['username']     = $user['username'];
+            $_SESSION['display_name'] = $user['username'];
+            $_SESSION['role']         = $user['role'];
 
             header('Location: dashboard.php');
             exit;
         } elseif (!$db_error) {
             register_failed_attempt();
+            $errors[] = 'Invalid username or password.';
         }
     }
 }
@@ -233,7 +278,7 @@ $locked = is_locked_out();
                     </div>
                 <?php endif; ?>
 
-                <form method="POST" action="" novalidate>
+                <form method="POST" action="" novalidate autocomplete="off">
                     <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
 
                     <div class="mb-4">
@@ -242,8 +287,8 @@ $locked = is_locked_out();
                             type="text"
                             id="username"
                             name="username"
-                            value="<?= e($old_username) ?>"
-                            autocomplete="username"
+                            value=""
+                            autocomplete="off"
                             <?= $locked ? 'disabled' : 'required autofocus' ?>
                             class="w-full px-3.5 py-2.5 border border-[#e3e3e0] dark:border-[#3E3E3A] dark:bg-[#161615] dark:text-[#EDEDEC] rounded-sm text-[13px] focus:outline-none focus:ring-2 focus:ring-green-700 focus:border-transparent disabled:bg-[#f5f5f4] dark:disabled:bg-[#1D1D1B] disabled:text-[#a1a09a]"
                             placeholder="Enter your username or email"
@@ -259,7 +304,8 @@ $locked = is_locked_out();
                             type="password"
                             id="password"
                             name="password"
-                            autocomplete="current-password"
+                            value=""
+                            autocomplete="off"
                             <?= $locked ? 'disabled' : 'required' ?>
                             class="w-full px-3.5 py-2.5 border border-[#e3e3e0] dark:border-[#3E3E3A] dark:bg-[#161615] dark:text-[#EDEDEC] rounded-sm text-[13px] focus:outline-none focus:ring-2 focus:ring-green-700 focus:border-transparent disabled:bg-[#f5f5f4] dark:disabled:bg-[#1D1D1B] disabled:text-[#a1a09a]"
                             placeholder="Enter your password"
@@ -303,6 +349,26 @@ $locked = is_locked_out();
 
         </main>
     </div>
+
+    <script>
+        // Belt-and-braces: some browsers ignore autocomplete="off" for login
+        // forms and will still autofill saved credentials, and the
+        // back/forward cache can restore previously typed values when the
+        // user navigates back to this page. Force both fields blank on
+        // every load/restore so the form always starts empty.
+        function clearLoginFields() {
+            const username = document.getElementById('username');
+            const password = document.getElementById('password');
+            if (username) username.value = '';
+            if (password) password.value = '';
+        }
+        document.addEventListener('DOMContentLoaded', clearLoginFields);
+        window.addEventListener('pageshow', function (event) {
+            if (event.persisted) {
+                clearLoginFields();
+            }
+        });
+    </script>
 
 </body>
 </html>

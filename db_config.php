@@ -1,15 +1,16 @@
 <?php
 /**
  * Database connection config for TTRS.
- * Keep this file OUTSIDE your public webroot if possible, or at
- * minimum block direct HTTP access to it via your web server config.
+ * Reads credentials from .env via getenv(), falling back to local defaults.
  */
 
-define('DB_HOST', '127.0.0.1');
-define('DB_PORT', '3306');
-define('DB_NAME', 'ttrs');
-define('DB_USER', 'root');      // change to a dedicated DB user in production
-define('DB_PASS', '');          // set your MySQL password here
+require_once __DIR__ . '/auth_common.php';
+
+defined('DB_HOST') or define('DB_HOST', getenv('DB_HOST') ?: '127.0.0.1');
+defined('DB_PORT') or define('DB_PORT', getenv('DB_PORT') ?: '3306');
+defined('DB_NAME') or define('DB_NAME', getenv('DB_NAME') ?: 'ttrs');
+defined('DB_USER') or define('DB_USER', getenv('DB_USER') ?: 'root');
+defined('DB_PASS') or define('DB_PASS', getenv('DB_PASS') !== false ? getenv('DB_PASS') : '');
 
 function get_db_connection(): PDO
 {

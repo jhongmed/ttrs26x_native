@@ -1,39 +1,40 @@
 <?php
 /**
  * SMTP Mail Configuration for TTRS (Gmail SMTP).
- *
- * HOW TO CONFIGURE GMAIL SMTP:
- * 1. Ensure 2-Step Verification is enabled on your Google Account:
- *    https://myaccount.google.com/signinoptions/two-step-verification
- * 2. Generate an App Password:
- *    https://myaccount.google.com/apppasswords
- *    - Enter an app name (e.g. "TTRS Login")
- *    - Google will provide a 16-character App Password (e.g. "abcd efgh ijkl mnop")
- * 3. Set SMTP_USER to your full Gmail address and SMTP_PASS to the 16-character App Password below.
+ * Reads configuration from .env via getenv().
  */
 
 require_once __DIR__ . '/vendor/autoload.php';
+require_once __DIR__ . '/auth_common.php';
 
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\SMTP;
 use PHPMailer\PHPMailer\Exception;
 
-// SMTP Server Settings for Gmail
-define('SMTP_HOST', getenv('SMTP_HOST') ?: 'smtp.gmail.com');
-define('SMTP_PORT', (int)(getenv('SMTP_PORT') ?: 587)); // 587 for STARTTLS, 465 for SMTPS
-define('SMTP_ENCRYPTION', getenv('SMTP_ENCRYPTION') ?: 'tls'); // 'tls' or 'ssl'
-define('SMTP_AUTH', true);
+// SMTP Server Settings
+defined('SMTP_HOST') or define('SMTP_HOST', getenv('SMTP_HOST') ?: 'smtp.gmail.com');
+defined('SMTP_PORT') or define('SMTP_PORT', (int)(getenv('SMTP_PORT') ?: 587));
+defined('SMTP_ENCRYPTION') or define('SMTP_ENCRYPTION', getenv('SMTP_ENCRYPTION') ?: 'tls');
+defined('SMTP_AUTH') or define('SMTP_AUTH', getenv('SMTP_AUTH') !== 'false');
 
-// Gmail Credentials - UPDATE THESE WITH YOUR GMAIL DETAILS
-define('SMTP_USER', getenv('SMTP_USER') ?: 'misdept.orchard@gmail.com');
-define('SMTP_PASS', getenv('SMTP_PASS') ?: 'cbho phrn uqsm fsmh');
+// Gmail / SMTP Credentials
+defined('SMTP_USER') or define('SMTP_USER', getenv('SMTP_USER') ?: '');
+defined('SMTP_PASS') or define('SMTP_PASS', getenv('SMTP_PASS') ?: '');
 
 // Default Sender Information
-define('MAIL_FROM_ADDRESS', getenv('MAIL_FROM_ADDRESS') ?: (SMTP_USER !== 'your-email@gmail.com' ? SMTP_USER : 'no-reply@theorchardgolf.com'));
-define('MAIL_FROM_NAME', getenv('MAIL_FROM_NAME') ?: 'The Orchard Golf & Country Club');
+defined('MAIL_FROM_ADDRESS') or define('MAIL_FROM_ADDRESS', getenv('MAIL_FROM_ADDRESS') ?: (SMTP_USER !== '' ? SMTP_USER : 'no-reply@theorchardgolf.com'));
+defined('MAIL_FROM_NAME') or define('MAIL_FROM_NAME', getenv('MAIL_FROM_NAME') ?: 'The Orchard Golf & Country Club');
 
 /**
- * Sends an email using PHPMailer and Gmail SMTP.
+ * Checks whether SMTP credentials have been set.
+ */
+function is_smtp_configured(): bool
+{
+    return SMTP_USER !== '' && SMTP_PASS !== '';
+}
+
+/**
+ * Sends an email using PHPMailer and SMTP.
  *
  * @param string $recipientEmail Target email address
  * @param string $subject Email subject line
@@ -43,9 +44,8 @@ define('MAIL_FROM_NAME', getenv('MAIL_FROM_NAME') ?: 'The Orchard Golf & Country
  */
 function send_app_mail(string $recipientEmail, string $subject, string $htmlBody, string $textBody = ''): bool
 {
-    // Safety check for placeholder credentials
-    if (SMTP_USER === 'your-email@gmail.com' || SMTP_PASS === 'your-16-char-app-password') {
-        error_log('[TTRS Mail] Gmail SMTP credentials are not configured in mail_config.php. Please set your Gmail address and App Password.');
+    if (!is_smtp_configured()) {
+        error_log('[TTRS Mail] SMTP_USER and/or SMTP_PASS are not set. Cannot send email to: ' . $recipientEmail);
         return false;
     }
 
@@ -61,12 +61,17 @@ function send_app_mail(string $recipientEmail, string $subject, string $htmlBody
         $mail->CharSet    = 'UTF-8';
 
         // Encryption and Port
-        if (strtolower(SMTP_ENCRYPTION) === 'ssl') {
+        $enc = strtolower(SMTP_ENCRYPTION);
+        if ($enc === 'ssl' || $enc === 'smtps') {
             $mail->SMTPSecure = PHPMailer::ENCRYPTION_SMTPS;
             $mail->Port       = SMTP_PORT ?: 465;
-        } else {
+        } elseif ($enc === 'tls' || $enc === 'starttls') {
             $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
             $mail->Port       = SMTP_PORT ?: 587;
+        } else {
+            $mail->SMTPSecure  = '';
+            $mail->SMTPAutoTLS = false;
+            $mail->Port        = SMTP_PORT ?: 25;
         }
 
         // Recipients
@@ -86,3 +91,4 @@ function send_app_mail(string $recipientEmail, string $subject, string $htmlBody
         return false;
     }
 }
+
