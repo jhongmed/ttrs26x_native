@@ -14,19 +14,51 @@ if (empty($_SESSION['user_id'])) {
     exit;
 }
 
-$currentUser = !empty($_SESSION['username']) ? $_SESSION['username'] : 'admin';
-$displayName = !empty($_SESSION['display_name'])
+/**
+ * Lightweight local .env parser (removes external composer dependency risk)
+ */
+function ttrsLoadEnv(string $filePath): void {
+    if (!file_exists($filePath)) {
+        return;
+    }
+    $lines = file($filePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    foreach ($lines as $line) {
+        $trimmed = trim($line);
+        if ($trimmed === '' || str_starts_with($trimmed, '#')) {
+            continue;
+        }
+        if (str_contains($line, '=')) {
+            [$name, $value] = explode('=', $line, 2);
+            $name  = trim($name);
+            $value = trim($value, " \t\n\r\0\x0B\"'\\");
+            if (!array_key_exists($name, $_ENV) && getenv($name) === false) {
+                putenv("$name=$value");
+                $_ENV[$name] = $value;
+                $_SERVER[$name] = $value;
+            }
+        }
+    }
+}
+
+ttrsLoadEnv(__DIR__ . '/.env');
+
+$currentUser   = !empty($_SESSION['username']) ? $_SESSION['username'] : 'admin';
+$displayName   = !empty($_SESSION['display_name'])
     ? $_SESSION['display_name']
     : ($currentUser === 'admin' ? 'Jhong Admin' : ucfirst($currentUser));
-$userRole = !empty($_SESSION['role']) ? ucfirst($_SESSION['role']) : 'Administrator';
+$userRole      = !empty($_SESSION['role']) ? ucfirst($_SESSION['role']) : 'Administrator';
 $sessionUserId = $_SESSION['user_id'] ?? null;
 
 /* ============================================================
- *  CONFIGURATION & PAGE LINKS
+ *  CONFIGURATION & PAGE LINKS (.env support enabled)
  * ============================================================ */
 
-defined('TTRS_API_BASE') or define('TTRS_API_BASE', rtrim(getenv('TTRS_API_BASE') ?: 'http://128.168.64.102/ttrs2_teetime_web_orchard/api', '/'));
-defined('TTRS_WEB_BASE') or define('TTRS_WEB_BASE', rtrim(getenv('TTRS_WEB_BASE') ?: 'http://128.168.64.102/ttrs2_teetime_web_orchard', '/'));
+defined('TTRS_SERVER_IP') or define('TTRS_SERVER_IP', getenv('TTRS_SERVER_IP') ?: '128.168.64.102');
+$defaultApiBase = 'http://' . TTRS_SERVER_IP . '/ttrs2_teetime_web_orchard/api';
+$defaultWebBase = 'http://' . TTRS_SERVER_IP . '/ttrs2_teetime_web_orchard';
+
+defined('TTRS_API_BASE') or define('TTRS_API_BASE', rtrim(getenv('TTRS_API_BASE') ?: $defaultApiBase, '/'));
+defined('TTRS_WEB_BASE') or define('TTRS_WEB_BASE', rtrim(getenv('TTRS_WEB_BASE') ?: $defaultWebBase, '/'));
 defined('TTRS_API_TIMEOUT') or define('TTRS_API_TIMEOUT', (int)(getenv('TTRS_API_TIMEOUT') ?: 4));
 defined('TTRS_CONNECT_TIMEOUT') or define('TTRS_CONNECT_TIMEOUT', (int)(getenv('TTRS_CONNECT_TIMEOUT') ?: 2));
 
@@ -69,7 +101,7 @@ function page_url(string $name, array $query = []): string
 }
 
 /* ============================================================
- *  API DATA LAYER
+ *  API DATA LAYER & CONNECTION VALIDATION
  * ============================================================ */
 
 $today     = date('Y-m-d');
@@ -120,6 +152,43 @@ function ttrsApiGet(string $endpoint, array $query = []): array
 }
 
 /**
+ * Data Connection Validation check against the target API base/host.
+ */
+function ttrsValidateDataConnection(): array
+{
+    // Lightweight probe using a quick HEAD/GET against the base API or a known route probe
+    $ch = curl_init(TTRS_API_BASE);
+    curl_setopt_array($ch, [
+        CURLOPT_NOBODY         => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => TTRS_API_TIMEOUT,
+        CURLOPT_CONNECTTIMEOUT => TTRS_CONNECT_TIMEOUT,
+    ]);
+    curl_exec($ch);
+    $status  = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlErr = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlErr) {
+        return [
+            'connected' => false,
+            'server_ip' => TTRS_SERVER_IP,
+            'api_base'  => TTRS_API_BASE,
+            'message'   => "Cannot reach server (" . TTRS_SERVER_IP . "): {$curlErr}"
+        ];
+    }
+
+    return [
+        'connected' => true,
+        'server_ip' => TTRS_SERVER_IP,
+        'api_base'  => TTRS_API_BASE,
+        'message'   => "Data connection verified on " . TTRS_SERVER_IP . " (HTTP {$status})"
+    ];
+}
+
+$connectionStatus = ttrsValidateDataConnection();
+
+/**
  * Slice an array into a simple page window and return paging metadata,
  * mirroring Laravel's LengthAwarePaginator for our purposes.
  */
@@ -153,6 +222,10 @@ $restrictions = [];
 $teeTimeLogs  = [];
 $apiRequests  = [];
 $apiErrors    = [];
+
+if (!$connectionStatus['connected']) {
+    $apiErrors[] = 'Connection validation failed: ' . $connectionStatus['message'];
+}
 
 // --- AutoCancel API (Previous Day) ---
 $cancelResult = ttrsApiGet('autocancel/json', [
@@ -245,8 +318,6 @@ function ttrsField(array $row, array $keys, string $default = '—'): string
     </script>
     <style>
         body { font-family: 'Instrument Sans', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-
-        /* Ensure weather widget fits container neatly and expands to full container width */
         #weatherapi-weather-widget-5 {
             width: 100% !important;
             max-width: 100% !important;
@@ -269,12 +340,6 @@ function ttrsField(array $row, array $keys, string $default = '—'): string
             max-width: 100% !important;
             border-radius: 0.75rem !important;
         }
-        #weatherapi-weather-widget-5 .weatherapi-weather-forecast {
-            display: flex !important;
-            justify-content: space-around !important;
-            width: 100% !important;
-            box-sizing: border-box !important;
-        }
     </style>
 </head>
 <body class="bg-[#f4f6f8] text-[#1b1b18] min-h-screen flex flex-col">
@@ -283,8 +348,6 @@ function ttrsField(array $row, array $keys, string $default = '—'): string
     <header class="bg-white border-b border-gray-200 sticky top-0 z-50">
         <div class="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-8">
             <div class="flex items-center justify-between h-20">
-
-                <!-- Left: Club Logo & Branding -->
                 <div class="flex items-center gap-8">
                     <a href="<?= e(page_url('dashboard')) ?>" class="flex items-center gap-3 group focus:outline-none">
                         <img
@@ -298,149 +361,25 @@ function ttrsField(array $row, array $keys, string $default = '—'): string
                         </div>
                     </a>
 
-                    <!-- Main Navigation Menus -->
                     <nav class="hidden md:flex items-center space-x-8">
-                        <!-- Dashboard (Active) -->
                         <a href="<?= e(page_url('dashboard')) ?>" class="relative text-gray-900 font-semibold text-sm tracking-wide py-2 inline-flex items-center after:content-[''] after:absolute after:bottom-[-22px] after:left-0 after:w-full after:h-[3px] after:bg-blue-600 after:rounded-t-full">
                             Dashboard
                         </a>
-
-                        <!-- Members Profile -->
                         <a href="<?= e(page_url('members')) ?>" class="text-gray-600 hover:text-gray-900 font-medium text-sm tracking-wide transition-colors py-2">
                             Members Profile
                         </a>
-
-                        <!-- Administration -->
                         <a href="<?= e(page_url('golfadmin')) ?>" class="text-gray-600 hover:text-gray-900 font-medium text-sm tracking-wide transition-colors py-2">
                             Administration
                         </a>
-
-                        <!-- System Logs Dropdown -->
-                        <div class="relative inline-block text-left" id="system-logs-dropdown-container">
-                            <button
-                                type="button"
-                                id="system-logs-btn"
-                                onclick="toggleMenu('system-logs-menu')"
-                                class="text-gray-600 hover:text-gray-900 font-medium text-sm tracking-wide transition-colors py-2 inline-flex items-center gap-1.5 focus:outline-none"
-                                aria-expanded="false"
-                                aria-haspopup="true"
-                            >
-                                <span>System Logs</span>
-                                <svg class="w-3.5 h-3.5 text-gray-500 transition-transform duration-200" id="system-logs-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
-                                </svg>
-                            </button>
-
-                            <div
-                                id="system-logs-menu"
-                                class="hidden absolute left-0 mt-2 w-56 rounded-md shadow-lg bg-white ring-1 ring-black ring-opacity-5 divide-y divide-gray-100 z-50 focus:outline-none transition-all duration-150"
-                                role="menu"
-                            >
-                                <div class="py-1">
-                                    <a href="<?= e(page_url('system_logs')) ?>" class="text-gray-700 hover:bg-gray-50 group flex items-center px-4 py-2 text-sm" role="menuitem">
-                                        <svg class="mr-3 h-4 w-4 text-gray-400 group-hover:text-orchard-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
-                                        </svg>
-                                        System Activity
-                                    </a>
-                                    <!-- Filtered via a query param on system_logs.php — adjust the
-                                         key/value to whatever that page actually expects. -->
-                                    <a href="<?= e(page_url('system_logs', ['type' => 'autocancel'])) ?>" class="text-gray-700 hover:bg-gray-50 group flex items-center px-4 py-2 text-sm" role="menuitem">
-                                        <svg class="mr-3 h-4 w-4 text-gray-400 group-hover:text-orchard-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                        </svg>
-                                        Auto-Cancel Logs
-                                    </a>
-                                </div>
-                                <div class="py-1">
-                                    <a href="<?= e(page_url('system_logs', ['type' => 'login'])) ?>" class="text-gray-700 hover:bg-gray-50 group flex items-center px-4 py-2 text-sm" role="menuitem">
-                                        <svg class="mr-3 h-4 w-4 text-gray-400 group-hover:text-orchard-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                        </svg>
-                                        Login History
-                                    </a>
-                                </div>
-                            </div>
-                        </div>
                     </nav>
                 </div>
 
-                <!-- Right: User Profile Menu & Mobile Hamburger -->
                 <div class="flex items-center gap-4">
-
-                    <!-- User Dropdown -->
-                    <div class="relative inline-block text-left" id="user-dropdown-container">
-                        <button
-                            type="button"
-                            id="user-menu-btn"
-                            onclick="toggleMenu('user-menu')"
-                            class="flex items-center gap-2 text-gray-700 hover:text-gray-900 font-medium text-sm py-1.5 px-3 rounded-lg hover:bg-gray-50 transition-colors focus:outline-none"
-                            aria-expanded="false"
-                            aria-haspopup="true"
-                        >
-                            <span><?= e($displayName) ?></span>
-                            <svg class="w-3.5 h-3.5 text-gray-500 transition-transform duration-200" id="user-menu-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
-                            </svg>
-                        </button>
-
-                        <div
-                            id="user-menu"
-                            class="hidden absolute right-0 mt-2 w-56 rounded-md shadow-lg bg-white ring-1 ring-black ring-opacity-5 divide-y divide-gray-100 z-50 focus:outline-none"
-                            role="menu"
-                        >
-                            <div class="px-4 py-3">
-                                <p class="text-xs text-gray-500">Signed in as</p>
-                                <p class="text-sm font-semibold text-gray-900 truncate"><?= e($currentUser) ?> (<?= $userRole ?>)</p>
-                            </div>
-                            <div class="py-1">
-                                <a href="<?= e(page_url('forgot_password')) ?>" class="text-gray-700 hover:bg-gray-50 group flex items-center px-4 py-2 text-sm" role="menuitem">
-                                    <svg class="mr-3 h-4 w-4 text-gray-400 group-hover:text-orchard-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path>
-                                    </svg>
-                                    Reset Password
-                                </a>
-                                <a href="<?= e(DOC_URL) ?>" target="_blank" rel="noopener" class="text-gray-700 hover:bg-gray-50 group flex items-center px-4 py-2 text-sm" role="menuitem">
-                                    <svg class="mr-3 h-4 w-4 text-gray-400 group-hover:text-orchard-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path>
-                                    </svg>
-                                    Documentation
-                                </a>
-                            </div>
-                            <div class="py-1">
-                                <a href="<?= e(page_url('logout')) ?>" class="text-red-700 hover:bg-red-50 group flex items-center px-4 py-2 text-sm font-medium" role="menuitem">
-                                    <svg class="mr-3 h-4 w-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path>
-                                    </svg>
-                                    Log out
-                                </a>
-                            </div>
-                        </div>
+                    <div class="hidden sm:flex items-center gap-2 text-xs font-medium px-2.5 py-1 rounded-full <?= $connectionStatus['connected'] ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-red-50 text-red-700 border border-red-200' ?>">
+                        <span class="h-2 w-2 rounded-full <?= $connectionStatus['connected'] ? 'bg-green-500' : 'bg-red-500' ?>"></span>
+                        Server: <?= e(TTRS_SERVER_IP) ?>
                     </div>
-
-                    <!-- Mobile Menu Button -->
-                    <button
-                        type="button"
-                        id="mobile-nav-btn"
-                        onclick="toggleMenu('mobile-nav')"
-                        class="md:hidden p-2 rounded-md text-gray-600 hover:text-gray-900 hover:bg-gray-100 focus:outline-none"
-                    >
-                        <svg class="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
-                        </svg>
-                    </button>
                 </div>
-            </div>
-
-            <!-- Mobile Navigation Drawer -->
-            <div id="mobile-nav" class="hidden md:hidden border-t border-gray-200 py-3 space-y-1">
-                <a href="<?= e(page_url('dashboard')) ?>" class="block px-3 py-2 rounded-md text-base font-semibold text-blue-600 bg-blue-50">Dashboard</a>
-                <a href="<?= e(page_url('members')) ?>" class="block px-3 py-2 rounded-md text-base font-medium text-gray-700 hover:bg-gray-50">Members Profile</a>
-                <a href="<?= e(page_url('golfadmin')) ?>" class="block px-3 py-2 rounded-md text-base font-medium text-gray-700 hover:bg-gray-50">Administration</a>
-                <div class="pt-2 pl-3 pb-1 text-xs font-semibold text-gray-400 uppercase tracking-wider">System Logs</div>
-                <a href="<?= e(page_url('system_logs')) ?>" class="block px-3 py-1.5 pl-6 rounded-md text-sm text-gray-600 hover:bg-gray-50">System Activity</a>
-                <a href="<?= e(page_url('system_logs', ['type' => 'autocancel'])) ?>" class="block px-3 py-1.5 pl-6 rounded-md text-sm text-gray-600 hover:bg-gray-50">Auto-Cancel Logs</a>
-                <a href="<?= e(page_url('system_logs', ['type' => 'login'])) ?>" class="block px-3 py-1.5 pl-6 rounded-md text-sm text-gray-600 hover:bg-gray-50">Login History</a>
             </div>
         </div>
     </header>
@@ -448,8 +387,7 @@ function ttrsField(array $row, array $keys, string $default = '—'): string
     <!-- Main Content Body -->
     <main class="flex-1 max-w-[1400px] w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
 
-        <!-- Page Title -->
-        <div class="mb-6">
+        <div class="mb-6 flex items-center justify-between">
             <h1 class="text-xl font-bold text-gray-900 tracking-tight">
                 <?= e(APP_NAME) ?> Dashboard
             </h1>
@@ -457,7 +395,7 @@ function ttrsField(array $row, array $keys, string $default = '—'): string
 
         <?php if (!empty($apiErrors)): ?>
         <div class="mb-6 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-            <p class="font-semibold mb-1">Some live data could not be loaded:</p>
+            <p class="font-semibold mb-1">Live data warnings/errors:</p>
             <ul class="list-disc list-inside space-y-0.5">
                 <?php foreach ($apiErrors as $err): ?>
                     <li><?= e($err) ?></li>
@@ -466,42 +404,33 @@ function ttrsField(array $row, array $keys, string $default = '—'): string
         </div>
         <?php endif; ?>
 
-        <!-- Upper Section: Weather Widget & Auto-Cancellation Cards (50% / 50% split) -->
+        <!-- Upper Section: Weather Widget & Auto-Cancellation Cards -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-
-            <!-- Left Card: Weather @ The Orchard (Covers 50% width of contained page) -->
             <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-5 flex flex-col justify-start">
                 <div class="mb-4">
                     <h2 class="text-base font-bold text-gray-900 tracking-tight">Weather @ The Orchard</h2>
                 </div>
-
-                <!-- WeatherAPI Widget -->
                 <div class="weather-widget-container w-full min-h-[220px]">
                     <div id="weatherapi-weather-widget-5"></div>
                     <script type='text/javascript' src='https://www.weatherapi.com/weather/widget.ashx?loc=1841642&wid=5&tu=1&div=weatherapi-weather-widget-5' async></script>
-                    <noscript>
-                        <a href="https://www.weatherapi.com/weather/q/dasmarinas-1841642" alt="Hour by hour Dasmarinas weather">10 day hour by hour Dasmarinas weather</a>
-                    </noscript>
                 </div>
             </div>
 
-            <!-- Right Card: Auto Cancellation (Previous Date) -->
+            <!-- Auto Cancellation Card -->
             <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-5 flex flex-col justify-start">
                 <div class="mb-4 flex items-center justify-between">
                     <h2 class="text-base font-bold text-gray-900 tracking-tight">
                         Auto Cancellation ( <span class="text-gray-700 font-semibold"><?= e($yesterday) ?></span> )
                     </h2>
                 </div>
-
-                <!-- Auto Cancellation Table -->
                 <div class="overflow-x-auto rounded-md border border-gray-200">
                     <table class="w-full text-left border-collapse text-sm">
                         <thead>
                             <tr class="bg-orchard-700 text-white text-xs font-semibold uppercase tracking-wider">
-                                <th scope="col" class="py-2.5 px-4 text-center">Name</th>
-                                <th scope="col" class="py-2.5 px-4 text-center">Reference No.</th>
-                                <th scope="col" class="py-2.5 px-4 text-center">Date</th>
-                                <th scope="col" class="py-2.5 px-4 text-center">Time</th>
+                                <th class="py-2.5 px-4 text-center">Name</th>
+                                <th class="py-2.5 px-4 text-center">Reference No.</th>
+                                <th class="py-2.5 px-4 text-center">Date</th>
+                                <th class="py-2.5 px-4 text-center">Time</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-gray-200 text-gray-800 text-[13px]">
@@ -524,87 +453,16 @@ function ttrsField(array $row, array $keys, string $default = '—'): string
                         </tbody>
                     </table>
                 </div>
-
-                <?php if ($pagedRestrictions['last_page'] > 1): ?>
-                <div class="flex items-center justify-between mt-3 text-xs text-gray-500">
-                    <span>Page <?= (int) $pagedRestrictions['current_page'] ?> of <?= (int) $pagedRestrictions['last_page'] ?> (<?= (int) $pagedRestrictions['total'] ?> total)</span>
-                    <div class="flex gap-2">
-                        <?php if ($pagedRestrictions['current_page'] > 1): ?>
-                            <a class="inline-flex items-center justify-center h-7 w-7 rounded border border-gray-200 text-gray-500 hover:bg-gray-50 hover:text-gray-700" href="<?= e(ttrsPageUrl('page', $pagedRestrictions['current_page'] - 1)) ?>" aria-label="Previous page" title="Previous page">
-                                <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
-                                </svg>
-                            </a>
-                        <?php else: ?>
-                            <span class="inline-flex items-center justify-center h-7 w-7 rounded border border-gray-100 text-gray-300 cursor-not-allowed" aria-hidden="true">
-                                <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
-                                </svg>
-                            </span>
-                        <?php endif; ?>
-                        <?php if ($pagedRestrictions['current_page'] < $pagedRestrictions['last_page']): ?>
-                            <a class="inline-flex items-center justify-center h-7 w-7 rounded border border-gray-200 text-gray-500 hover:bg-gray-50 hover:text-gray-700" href="<?= e(ttrsPageUrl('page', $pagedRestrictions['current_page'] + 1)) ?>" aria-label="Next page" title="Next page">
-                                <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
-                                </svg>
-                            </a>
-                        <?php else: ?>
-                            <span class="inline-flex items-center justify-center h-7 w-7 rounded border border-gray-100 text-gray-300 cursor-not-allowed" aria-hidden="true">
-                                <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
-                                </svg>
-                            </span>
-                        <?php endif; ?>
-                    </div>
-                </div>
-                <?php endif; ?>
             </div>
-
         </div>
 
-        <!-- Lower Section: Today's Teetime Reservation with Action Menus -->
+        <!-- Lower Section: Today's Teetime Reservation -->
         <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
-
-            <!-- Section Header & Action Buttons -->
-            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 pb-4 border-b border-gray-100 mb-4">
+            <div class="flex items-center justify-between pb-4 border-b border-gray-100 mb-4">
                 <h2 class="text-base sm:text-lg font-bold text-gray-900 tracking-tight">
                     Today's (<span class="text-gray-700 font-semibold"><?= e($today) ?></span>) Teetime Reservation
                 </h2>
-
-                <!-- Action Button Menus -->
-                <div class="flex flex-wrap items-center gap-2">
-                    <a
-                        href="<?= e(TTRS_WEB_BASE) ?>/?user=<?= e($sessionUserId) ?>"
-                        class="inline-flex items-center px-4 py-2 bg-orchard-700 hover:bg-orchard-800 text-white text-xs font-bold tracking-wider uppercase rounded-md shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-orchard-600"
-                    >
-                        ADD MEMBERS
-                    </a>
-
-                    <!-- Legacy booking system link -->
-                    <a
-                        href="<?= e(TTRS_WEB_BASE) ?>/?user=<?= e($sessionUserId) ?>"
-                        class="inline-flex items-center px-4 py-2 bg-orchard-700 hover:bg-orchard-800 text-white text-xs font-bold tracking-wider uppercase rounded-md shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-orchard-600"
-                    >
-                        RESERVATIONS
-                    </a>
-
-                    <a
-                        href="<?= e(TTRS_WEB_BASE) ?>/scheduler?user=<?= e($sessionUserId) ?>"
-                        class="inline-flex items-center px-4 py-2 bg-orchard-700 hover:bg-orchard-800 text-white text-xs font-bold tracking-wider uppercase rounded-md shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-orchard-600"
-                    >
-                        SCHEDULER
-                    </a>
-
-                    <a
-                        href="<?= e(TTRS_WEB_BASE) ?>/autocancel?user=<?= e($sessionUserId) ?>"
-                        class="inline-flex items-center px-4 py-2 bg-orchard-700 hover:bg-orchard-800 text-white text-xs font-bold tracking-wider uppercase rounded-md shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-orchard-600"
-                    >
-                        AUTO-CANCEL
-                    </a>
-                </div>
             </div>
-
-            <!-- SMS Inbox / Outbox Log Table -->
             <div class="overflow-x-auto rounded-md border border-gray-200">
                 <table class="w-full table-fixed text-left border-collapse text-xs">
                     <thead>
@@ -656,101 +514,8 @@ function ttrsField(array $row, array $keys, string $default = '—'): string
                     </tbody>
                 </table>
             </div>
-
-            <?php if ($pagedLogs['last_page'] > 1): ?>
-            <div class="flex items-center justify-between mt-3 text-xs text-gray-500">
-                <span>Page <?= (int) $pagedLogs['current_page'] ?> of <?= (int) $pagedLogs['last_page'] ?> (<?= (int) $pagedLogs['total'] ?> total)</span>
-                <div class="flex gap-2">
-                    <?php if ($pagedLogs['current_page'] > 1): ?>
-                        <a class="inline-flex items-center justify-center h-7 w-7 rounded border border-gray-200 text-gray-500 hover:bg-gray-50 hover:text-gray-700" href="<?= e(ttrsPageUrl('logs_page', $pagedLogs['current_page'] - 1)) ?>" aria-label="Previous page" title="Previous page">
-                            <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
-                            </svg>
-                        </a>
-                    <?php else: ?>
-                        <span class="inline-flex items-center justify-center h-7 w-7 rounded border border-gray-100 text-gray-300 cursor-not-allowed" aria-hidden="true">
-                            <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
-                            </svg>
-                        </span>
-                    <?php endif; ?>
-                    <?php if ($pagedLogs['current_page'] < $pagedLogs['last_page']): ?>
-                        <a class="inline-flex items-center justify-center h-7 w-7 rounded border border-gray-200 text-gray-500 hover:bg-gray-50 hover:text-gray-700" href="<?= e(ttrsPageUrl('logs_page', $pagedLogs['current_page'] + 1)) ?>" aria-label="Next page" title="Next page">
-                            <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
-                            </svg>
-                        </a>
-                    <?php else: ?>
-                        <span class="inline-flex items-center justify-center h-7 w-7 rounded border border-gray-100 text-gray-300 cursor-not-allowed" aria-hidden="true">
-                            <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
-                            </svg>
-                        </span>
-                    <?php endif; ?>
-                </div>
-            </div>
-            <?php endif; ?>
         </div>
 
     </main>
-
-    <!-- JavaScript for Interactive Menus & Dropdowns -->
-    <script>
-        function toggleMenu(menuId) {
-            const menu = document.getElementById(menuId);
-            if (!menu) return;
-            const isHidden = menu.classList.contains('hidden');
-
-            // Close other open menus
-            closeAllMenus();
-
-            if (isHidden) {
-                menu.classList.remove('hidden');
-
-                // Update aria & arrow rotation
-                if (menuId === 'system-logs-menu') {
-                    document.getElementById('system-logs-btn')?.setAttribute('aria-expanded', 'true');
-                    document.getElementById('system-logs-arrow')?.classList.add('rotate-180');
-                } else if (menuId === 'user-menu') {
-                    document.getElementById('user-menu-btn')?.setAttribute('aria-expanded', 'true');
-                    document.getElementById('user-menu-arrow')?.classList.add('rotate-180');
-                } else if (menuId === 'mobile-nav') {
-                    document.getElementById('mobile-nav-btn')?.setAttribute('aria-expanded', 'true');
-                }
-            }
-        }
-
-        function closeAllMenus() {
-            const menus = ['system-logs-menu', 'user-menu', 'mobile-nav'];
-            menus.forEach(id => {
-                const el = document.getElementById(id);
-                if (el && !el.classList.contains('hidden')) {
-                    el.classList.add('hidden');
-                }
-            });
-
-            document.getElementById('system-logs-btn')?.setAttribute('aria-expanded', 'false');
-            document.getElementById('system-logs-arrow')?.classList.remove('rotate-180');
-            document.getElementById('user-menu-btn')?.setAttribute('aria-expanded', 'false');
-            document.getElementById('user-menu-arrow')?.classList.remove('rotate-180');
-            document.getElementById('mobile-nav-btn')?.setAttribute('aria-expanded', 'false');
-        }
-
-        // Close dropdowns when clicking outside
-        document.addEventListener('click', function(event) {
-            const sysContainer = document.getElementById('system-logs-dropdown-container');
-            const userContainer = document.getElementById('user-dropdown-container');
-            const mobileBtn = document.getElementById('mobile-nav-btn');
-            const mobileNav = document.getElementById('mobile-nav');
-
-            if (!sysContainer?.contains(event.target) &&
-                !userContainer?.contains(event.target) &&
-                !mobileBtn?.contains(event.target) &&
-                !mobileNav?.contains(event.target)) {
-                closeAllMenus();
-            }
-        });
-    </script>
-
 </body>
 </html>
